@@ -618,6 +618,29 @@ func (l *kvLedger) CommitLegacy(pvtdataAndBlock *ledger.BlockAndPvtData, commitO
 	return nil
 }
 
+// preCheckReadSet validates the read-sets of the transactions in the block against the current
+// committed state without writing anything to the ledger. It returns a report of the conflicts
+// found. The actual commit still re-validates the read-sets to prevent TOCTOU races.
+func (l *kvLedger) preCheckReadSet(block *common.Block) (*ledger.ReadSetPreCheckReport, error) {
+	blockNo := block.GetHeader().GetNumber()
+	logger.Debugf("[%s] Pre-checking read-set versions for block [%d]", l.ledgerID, blockNo)
+	validationCodes, err := l.txmgr.PreCheckReadSet(block)
+	if err != nil {
+		return nil, err
+	}
+	report := &ledger.ReadSetPreCheckReport{
+		BlockNumber:       blockNo,
+		TxValidationCodes: validationCodes,
+	}
+	for txIndex, code := range validationCodes {
+		if code == peer.TxValidationCode_MVCC_READ_CONFLICT || code == peer.TxValidationCode_PHANTOM_READ_CONFLICT {
+			report.ConflictTxIndices = append(report.ConflictTxIndices, txIndex)
+		}
+	}
+	logger.Debugf("[%s] Read-set pre-check for block [%d] found %d conflict(s)", l.ledgerID, blockNo, len(report.ConflictTxIndices))
+	return report, nil
+}
+
 // commit commits the block and the corresponding pvt data in an atomic operation.
 func (l *kvLedger) commit(pvtdataAndBlock *ledger.BlockAndPvtData, commitOpts *ledger.CommitOptions) error {
 	var err error
@@ -646,6 +669,18 @@ func (l *kvLedger) commit(pvtdataAndBlock *ledger.BlockAndPvtData, commitOpts *l
 	}
 
 	logger.Debugf("[%s] Validating state for block [%d]", l.ledgerID, blockNo)
+
+	// Optional read-set conflict pre-check. This is advisory: it validates the read-sets of the
+	// transactions in the block against the current committed state without writing anything to
+	// the ledger. The actual commit below still re-validates the read-sets to prevent TOCTOU races.
+	if commitOpts.ReadSetPreCheck != nil {
+		report, err := l.preCheckReadSet(block)
+		if err != nil {
+			return err
+		}
+		*commitOpts.ReadSetPreCheck = *report
+	}
+
 	appInitiatedPurgeUpdates, txstatsInfo, updateBatchBytes, err := l.txmgr.ValidateAndPrepare(pvtdataAndBlock, true)
 	if err != nil {
 		return err

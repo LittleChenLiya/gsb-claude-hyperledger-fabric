@@ -120,6 +120,24 @@ func (p *CommitBatchPreparer) ValidateAndPrepareBatch(blockAndPvtdata *ledger.Bl
 	}, purgeUpdates, txsStatInfo, nil
 }
 
+// PreCheckReadSet validates the read-sets of the transactions in the block against the
+// current committed state without preparing any update batch for commit and without
+// writing anything to the ledger. It returns the validation code for each parsed
+// transaction. The actual commit still re-validates the read-sets to prevent TOCTOU races.
+func (p *CommitBatchPreparer) PreCheckReadSet(block *common.Block) (map[int]peer.TxValidationCode, error) {
+	internalBlock, _, err := preprocessProtoBlock(
+		p.postOrderSimulatorProvider,
+		p.db.ValidateKeyValue,
+		block,
+		true, // doMVCCValidation
+		p.customTxProcessors,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return p.validator.validateReadSetsForPreCheck(internalBlock)
+}
+
 // validateAndPreparePvtBatch pulls out the private write-set for the transactions that are marked as valid
 // by the internal public data validator. Finally, it validates (if not already self-endorsed) the pvt rwset against the
 // corresponding hash present in the public rwset

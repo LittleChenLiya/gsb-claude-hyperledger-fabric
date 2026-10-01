@@ -117,6 +117,40 @@ func (v *validator) validateAndPrepareBatch(blk *block, doMVCCValidation bool) (
 	return updates, purgeTracker.getUpdates(), nil
 }
 
+// validateReadSetsForPreCheck validates the read-sets of all transactions in the block
+// against the current committed state and against preceding transactions in the same block.
+// It returns the validation code for each transaction. No update batch is prepared for
+// commit and nothing is written to the ledger. The actual commit still re-validates the
+// read-sets to prevent TOCTOU races.
+func (v *validator) validateReadSetsForPreCheck(blk *block) (map[int]peer.TxValidationCode, error) {
+	// Check whether statedb implements BulkOptimizable interface. For now,
+	// only CouchDB implements BulkOptimizable to reduce the number of REST
+	// API calls from peer to CouchDB instance.
+	if v.db.IsBulkOptimizable() {
+		if err := v.preLoadCommittedVersionOfRSet(blk); err != nil {
+			return nil, err
+		}
+	}
+
+	validationCodes := make(map[int]peer.TxValidationCode)
+	updates := newPubAndHashUpdates()
+	for _, tx := range blk.txs {
+		validationCode, err := v.validateEndorserTX(tx.rwset, true, updates)
+		if err != nil {
+			return nil, err
+		}
+		validationCodes[tx.indexInBlock] = validationCode
+		if validationCode == peer.TxValidationCode_VALID {
+			// Apply the write set to the in-memory updates so that a read in a later
+			// transaction in the same block is checked against it (within-block conflict).
+			if err := updates.applyWriteSet(tx.rwset, version.NewHeight(blk.num, uint64(tx.indexInBlock)), v.db, tx.containsPostOrderWrites); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return validationCodes, nil
+}
+
 // validateEndorserTX validates endorser transaction
 func (v *validator) validateEndorserTX(
 	txRWSet *rwsetutil.TxRwSet,

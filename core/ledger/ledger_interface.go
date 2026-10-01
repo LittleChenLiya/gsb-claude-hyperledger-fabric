@@ -426,6 +426,29 @@ type BlockPvtdata struct {
 // CommitOptions encapsulates options associated with a block commit.
 type CommitOptions struct {
 	FetchPvtDataFromLedger bool
+	// ReadSetPreCheck, when non-nil, enables a read-set conflict pre-check before the
+	// block is committed. The pre-check validates the read-sets of the transactions in
+	// the block against the current committed state (and against preceding transactions
+	// in the same block) without writing anything to the ledger. The report is filled in
+	// with the conflicts found. The actual commit still re-validates the read-sets to
+	// prevent TOCTOU races. This field is optional; a nil value disables the pre-check.
+	ReadSetPreCheck *ReadSetPreCheckReport
+}
+
+// ReadSetPreCheckReport captures the result of a read-set conflict pre-check performed
+// before a block commit. The pre-check is advisory: it does not write to the ledger and
+// does not change the outcome of the actual commit, which re-validates the read-sets to
+// prevent TOCTOU races.
+type ReadSetPreCheckReport struct {
+	// BlockNumber is the number of the block that was pre-checked.
+	BlockNumber uint64
+	// ConflictTxIndices lists the indices (within the block) of the transactions whose
+	// read-sets conflict with the current committed state or with preceding transactions
+	// in the same block.
+	ConflictTxIndices []int
+	// TxValidationCodes maps transaction index to the validation code assigned during the
+	// pre-check. Only transactions that were parsed successfully are included in the map.
+	TxValidationCodes map[int]peer.TxValidationCode
 }
 
 // PvtCollFilter represents the set of the collection names (as keys of the map with value 'true')

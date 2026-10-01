@@ -14,6 +14,7 @@ import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset"
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset/kvrwset"
+	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric/common/ledger/snapshot"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/internal/version"
@@ -201,6 +202,29 @@ func (txmgr *LockBasedTxMgr) ValidateAndPrepare(blockAndPvtdata *ledger.BlockAnd
 
 	updateBytes, err := deterministicBytesForPubAndHashUpdates(batch)
 	return appPurgeUpdates, txstatsInfo, updateBytes, err
+}
+
+// PreCheckReadSet validates the read-sets of the transactions in the block against the
+// current committed state without writing anything to the ledger and without preparing
+// the block for commit. It returns the validation code for each parsed transaction.
+// The actual commit still re-validates the read-sets to prevent TOCTOU races.
+func (txmgr *LockBasedTxMgr) PreCheckReadSet(block *common.Block) (map[int]peer.TxValidationCode, error) {
+	// Among ValidateAndPrepare(), PrepareForExpiringKeys(), RemoveStaleAndCommitPvtDataOfOldBlocks(),
+	// and PreCheckReadSet(), we can allow only one function to execute at a time. The reason is
+	// that each function calls LoadCommittedVersions() which would clear the existing entries in
+	// the transient buffer and load new entries (such a transient buffer is not applicable for the
+	// golevelDB). As a result, these functions can interleave and nullify the optimization provided
+	// by the bulk read API.
+	logger.Debugf("Waiting for purge mgr to finish the background job of computing expirying keys for the block")
+	txmgr.pvtdataPurgeMgr.WaitForPrepareToFinish()
+	txmgr.oldBlockCommit.Lock()
+	defer txmgr.oldBlockCommit.Unlock()
+	logger.Debug("lock acquired on oldBlockCommit for pre-checking read-set versions")
+
+	// Clone the block so that preprocessing does not mutate the original block's transaction filter.
+	preCheckBlock := proto.Clone(block).(*common.Block)
+
+	return txmgr.commitBatchPreparer.PreCheckReadSet(preCheckBlock)
 }
 
 // RemoveStaleAndCommitPvtDataOfOldBlocks implements method in interface `txmgmt.TxMgr`
