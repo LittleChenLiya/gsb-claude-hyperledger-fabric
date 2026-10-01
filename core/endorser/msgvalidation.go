@@ -27,6 +27,11 @@ type UnpackedProposal struct {
 	SignatureHeader *common.SignatureHeader
 	SignedProposal  *peer.SignedProposal
 	ProposalHash    []byte
+	// TransientMap is the transient data carried by the proposal. It is not
+	// part of the ProposalHash, but it is retained so that read-only request
+	// fingerprinting can tell two same-TxID requests with different transient
+	// data apart.
+	TransientMap map[string][]byte
 }
 
 func (up *UnpackedProposal) ChannelID() string {
@@ -117,6 +122,7 @@ func UnpackProposal(signedProp *peer.SignedProposal) (*UnpackedProposal, error) 
 		ChaincodeName:   chaincodeHdrExt.GetChaincodeId().GetName(),
 		Input:           cis.GetChaincodeSpec().GetInput(),
 		ProposalHash:    propHash.Sum(nil)[:],
+		TransientMap:    cpp.GetTransientMap(),
 	}, nil
 }
 

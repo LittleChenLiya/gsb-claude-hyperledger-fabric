@@ -101,6 +101,11 @@ type Endorser struct {
 	Support                Support
 	PvtRWSetAssembler      PvtRWSetAssembler
 	Metrics                *Metrics
+	// RequestTracker is a read-only tracker that fingerprints endorsement
+	// requests by channel ID, transaction ID and payload. It only observes:
+	// it never bypasses proposal validation, ACL checks, simulation or
+	// endorsement. A nil tracker simply disables the bookkeeping.
+	RequestTracker *ProposalFingerprintTracker
 }
 
 // call specified chaincode (system or user)
@@ -294,7 +299,43 @@ func (e *Endorser) preProcess(up *UnpackedProposal, channel *Channel) error {
 		}
 	}
 
+	// Read-only idempotency tracking. This runs only after the proposal has
+	// passed signature/txid validation, the committed-transaction uniqueness
+	// check and the ACL/policy check above; tracking never replaces or skips
+	// them. The fingerprint covers the transient data, so two requests with
+	// the same transaction ID but different payloads are recorded as a payload
+	// mismatch instead of being merged. Observation never fails a request.
+	e.trackRequest(up)
+
 	return nil
+}
+
+// trackRequest records a read-only fingerprint of a validated endorsement
+// request. Any tracking outcome is logged only; request processing is
+// unaffected regardless of whether the request is a replay, a same-TxID
+// payload mismatch or a first sighting.
+func (e *Endorser) trackRequest(up *UnpackedProposal) {
+	if e.RequestTracker == nil {
+		return
+	}
+
+	fingerprint := ComputeProposalFingerprint(up.Input, up.TransientMap)
+	rec, replay, mismatch := e.RequestTracker.Observe(up.ChannelID(), up.TxID(), fingerprint, time.Now())
+	logger := decorateLogger(endorserLogger, &ccprovider.TransactionParams{
+		ChannelID: up.ChannelID(),
+		TxID:      up.TxID(),
+	})
+	switch {
+	case replay:
+		logger.Infof("duplicate endorsement request replay for fingerprint %s (request #%d)", fingerprint, rec.Requests)
+	case mismatch:
+		// The transaction ID matches an earlier request, but the chaincode
+		// input or transient data differs. The two requests are deliberately
+		// not merged.
+		logger.Warnf("endorsement request for transaction id carries a different payload fingerprint %s than the first request fingerprint %s (mismatch #%d); the requests were not merged", fingerprint, rec.Fingerprint, rec.PayloadMismatches)
+	default:
+		logger.Debugf("recording endorsement request fingerprint %s", fingerprint)
+	}
 }
 
 // ProcessProposal process the Proposal
