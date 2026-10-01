@@ -765,6 +765,7 @@ func serve(args []string) error {
 		LocalMSP:               localMSP,
 		Support:                endorserSupport,
 		Metrics:                endorser.NewMetrics(metricsProvider),
+		IdempotencyTracker:     endorser.NewIdempotencyTracker(),
 	}
 
 	// deploy system chaincodes

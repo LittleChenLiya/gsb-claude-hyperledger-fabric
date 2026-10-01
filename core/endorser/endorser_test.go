@@ -49,6 +49,52 @@ func sortChaincodeCall(a, b *pb.ChaincodeCall) int {
 	return 0
 }
 
+// buildIdempotencyProposal constructs a signed proposal that reuses the same
+// transaction ID (and therefore the same nonce and creator) but carries the
+// supplied transient data. Because the transient map is not part of the
+// transaction ID, two proposals built with different transient data share the
+// same txID while having different payloads.
+func buildIdempotencyProposal(txID string, transient map[string][]byte) *pb.SignedProposal {
+	channelHeader := protoutil.MarshalOrPanic(&cb.ChannelHeader{
+		Type:      int32(cb.HeaderType_ENDORSER_TRANSACTION),
+		ChannelId: "channel-id",
+		TxId:      txID,
+		Extension: protoutil.MarshalOrPanic(&pb.ChaincodeHeaderExtension{
+			ChaincodeId: &pb.ChaincodeID{
+				Name: "chaincode-name",
+			},
+		}),
+	})
+	signatureHeader := protoutil.MarshalOrPanic(&cb.SignatureHeader{
+		Creator: protoutil.MarshalOrPanic(&mspproto.SerializedIdentity{
+			Mspid: "msp-id",
+		}),
+		Nonce: []byte("nonce"),
+	})
+	header := protoutil.MarshalOrPanic(&cb.Header{
+		ChannelHeader:   channelHeader,
+		SignatureHeader: signatureHeader,
+	})
+	input := protoutil.MarshalOrPanic(&pb.ChaincodeInvocationSpec{
+		ChaincodeSpec: &pb.ChaincodeSpec{
+			Input: &pb.ChaincodeInput{
+				Args: [][]byte{[]byte("arg1"), []byte("arg2")},
+			},
+		},
+	})
+	payload := protoutil.MarshalOrPanic(&pb.ChaincodeProposalPayload{
+		Input:        input,
+		TransientMap: transient,
+	})
+	return &pb.SignedProposal{
+		ProposalBytes: protoutil.MarshalOrPanic(&pb.Proposal{
+			Header:  header,
+			Payload: payload,
+		}),
+		Signature: []byte("signature"),
+	}
+}
+
 var _ = Describe("Endorser", func() {
 	var (
 		fakeProposalDuration         *metricsfakes.Histogram
@@ -60,6 +106,8 @@ var _ = Describe("Endorser", func() {
 		fakeEndorsementsFailed       *metricsfakes.Counter
 		fakeDuplicateTxsFailure      *metricsfakes.Counter
 		fakeSimulateFailure          *metricsfakes.Counter
+		fakeIdempotentReplays        *metricsfakes.Counter
+		fakeIdempotencyConflicts     *metricsfakes.Counter
 
 		fakeLocalIdentity                *fake.Identity
 		fakeLocalMSPIdentityDeserializer *fake.IdentityDeserializer
@@ -101,6 +149,12 @@ var _ = Describe("Endorser", func() {
 
 		fakeDuplicateTxsFailure = &metricsfakes.Counter{}
 		fakeDuplicateTxsFailure.WithReturns(fakeDuplicateTxsFailure)
+
+		fakeIdempotentReplays = &metricsfakes.Counter{}
+		fakeIdempotentReplays.WithReturns(fakeIdempotentReplays)
+
+		fakeIdempotencyConflicts = &metricsfakes.Counter{}
+		fakeIdempotencyConflicts.WithReturns(fakeIdempotencyConflicts)
 
 		fakeProposalsReceived = &metricsfakes.Counter{}
 		fakeSuccessfulProposals = &metricsfakes.Counter{}
@@ -193,9 +247,12 @@ var _ = Describe("Endorser", func() {
 				EndorsementsFailed:       fakeEndorsementsFailed,
 				DuplicateTxsFailure:      fakeDuplicateTxsFailure,
 				SimulationFailure:        fakeSimulateFailure,
+				IdempotentReplays:        fakeIdempotentReplays,
+				IdempotencyConflicts:     fakeIdempotencyConflicts,
 			},
-			Support:        fakeSupport,
-			ChannelFetcher: fakeChannelFetcher,
+			Support:            fakeSupport,
+			ChannelFetcher:     fakeChannelFetcher,
+			IdempotencyTracker: endorser.NewIdempotencyTracker(),
 		}
 	})
 
@@ -310,6 +367,106 @@ var _ = Describe("Endorser", func() {
 					Message: "duplicate transaction found [6f142589e4ef6a1e62c9c816e2074f70baa9f7cf67c2f0c287d4ef907d6d2015]. Creator [0a066d73702d6964]",
 				},
 			}))
+		})
+	})
+
+	Context("when tracking request fingerprints for idempotency", func() {
+		var txID string
+
+		BeforeEach(func() {
+			txID = "6f142589e4ef6a1e62c9c816e2074f70baa9f7cf67c2f0c287d4ef907d6d2015"
+		})
+
+		It("records the fingerprint, treats an identical request as a replay, and still validates ACL", func() {
+			propA := buildIdempotencyProposal(txID, map[string][]byte{"key1": []byte("value-a")})
+
+			// first request with payload A: success
+			resp1, err := e.ProcessProposal(context.Background(), propA)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resp1.GetResponse().GetStatus()).To(Equal(int32(200)))
+
+			// second request with the same txID and identical payload: success, recorded as a replay
+			resp2, err := e.ProcessProposal(context.Background(), propA)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resp2.GetResponse().GetStatus()).To(Equal(int32(200)))
+
+			Expect(fakeIdempotentReplays.AddCallCount()).To(Equal(1))
+			Expect(fakeIdempotencyConflicts.AddCallCount()).To(Equal(0))
+
+			// tracking must not skip policy validation: ACL runs for both requests
+			Expect(fakeSupport.CheckACLCallCount()).To(Equal(2))
+		})
+
+		It("rejects a request that reuses the txID with different transient data as a conflict", func() {
+			propA := buildIdempotencyProposal(txID, map[string][]byte{"key1": []byte("value-a")})
+			propB := buildIdempotencyProposal(txID, map[string][]byte{"key1": []byte("value-b")})
+
+			// first request with payload A: success
+			_, err := e.ProcessProposal(context.Background(), propA)
+			Expect(err).NotTo(HaveOccurred())
+
+			// second request with the same txID but different transient data: conflict, must not be merged
+			resp, err := e.ProcessProposal(context.Background(), propB)
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(MatchError(ContainSubstring("idempotency conflict")))
+			Expect(resp.GetResponse().GetStatus()).To(Equal(int32(500)))
+			Expect(resp.GetResponse().GetMessage()).To(ContainSubstring("idempotency conflict"))
+
+			Expect(fakeIdempotencyConflicts.AddCallCount()).To(Equal(1))
+			Expect(fakeIdempotentReplays.AddCallCount()).To(Equal(0))
+
+			// ACL ran for the first request; the conflicting request is rejected outright.
+			Expect(fakeSupport.CheckACLCallCount()).To(Equal(1))
+		})
+
+		It("does not merge different transient data even when the non-transient payload is identical", func() {
+			propA := buildIdempotencyProposal(txID, map[string][]byte{"shared": []byte("a")})
+			propB := buildIdempotencyProposal(txID, map[string][]byte{"shared": []byte("b")})
+
+			_, err := e.ProcessProposal(context.Background(), propA)
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = e.ProcessProposal(context.Background(), propB)
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(MatchError(ContainSubstring("idempotency conflict")))
+		})
+
+		It("treats requests with identical transient data but different non-transient input as a conflict", func() {
+			propA := buildIdempotencyProposal(txID, map[string][]byte{"shared": []byte("a")})
+			// same txID, same transient, but different input args
+			propB := buildIdempotencyProposal(txID, map[string][]byte{"shared": []byte("a")})
+			// mutate the non-transient input of propB
+			propB.ProposalBytes = protoutil.MarshalOrPanic(&pb.Proposal{
+				Header: protoutil.MarshalOrPanic(&cb.Header{
+					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
+						Type:      int32(cb.HeaderType_ENDORSER_TRANSACTION),
+						ChannelId: "channel-id",
+						TxId:      txID,
+						Extension: protoutil.MarshalOrPanic(&pb.ChaincodeHeaderExtension{
+							ChaincodeId: &pb.ChaincodeID{Name: "chaincode-name"},
+						}),
+					}),
+					SignatureHeader: protoutil.MarshalOrPanic(&cb.SignatureHeader{
+						Creator: protoutil.MarshalOrPanic(&mspproto.SerializedIdentity{Mspid: "msp-id"}),
+						Nonce:   []byte("nonce"),
+					}),
+				}),
+				Payload: protoutil.MarshalOrPanic(&pb.ChaincodeProposalPayload{
+					Input: protoutil.MarshalOrPanic(&pb.ChaincodeInvocationSpec{
+						ChaincodeSpec: &pb.ChaincodeSpec{
+							Input: &pb.ChaincodeInput{Args: [][]byte{[]byte("different-arg")}},
+						},
+					}),
+					TransientMap: map[string][]byte{"shared": []byte("a")},
+				}),
+			})
+
+			_, err := e.ProcessProposal(context.Background(), propA)
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = e.ProcessProposal(context.Background(), propB)
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(MatchError(ContainSubstring("idempotency conflict")))
 		})
 	})
 

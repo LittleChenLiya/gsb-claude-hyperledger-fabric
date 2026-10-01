@@ -101,6 +101,11 @@ type Endorser struct {
 	Support                Support
 	PvtRWSetAssembler      PvtRWSetAssembler
 	Metrics                *Metrics
+	// IdempotencyTracker records request fingerprints so that repeated endorsement
+	// requests can be distinguished from conflicting requests that reuse a
+	// transaction ID with a different payload. The tracker never skips policy
+	// validation; it is consulted in addition to the ACL check.
+	IdempotencyTracker *IdempotencyTracker
 }
 
 // call specified chaincode (system or user)
@@ -282,6 +287,26 @@ func (e *Endorser) preProcess(up *UnpackedProposal, channel *Channel) error {
 		// addition to benign retries
 		e.Metrics.DuplicateTxsFailure.With(meterLabels...).Add(1)
 		return errors.Errorf("duplicate transaction found [%s]. Creator [%x]", up.ChannelHeader.GetTxId(), up.SignatureHeader.GetCreator())
+	}
+
+	// Fingerprint-based idempotency tracking. A repeated request carrying the
+	// same payload is a benign retry; a request that reuses the transaction ID
+	// with a different payload (for example, different transient data) is a
+	// conflict and must not be merged. The tracker never skips policy validation:
+	// the ACL check below still runs, even when the request is recognized as a
+	// replay.
+	if e.IdempotencyTracker != nil {
+		fp := FingerprintRequest(up.SignedProposal)
+		replay, err := e.IdempotencyTracker.CheckAndRecord(up.ChannelHeader.GetChannelId(), up.ChannelHeader.GetTxId(), fp)
+		if err != nil {
+			e.Metrics.IdempotencyConflicts.With(meterLabels...).Add(1)
+			endorserLogger.Warnw("idempotency conflict", "error", err.Error(), "txID", up.ChannelHeader.GetTxId())
+			return err
+		}
+		if replay {
+			e.Metrics.IdempotentReplays.With(meterLabels...).Add(1)
+			endorserLogger.Infof("received repeated endorsement request for txID [%s] with identical payload", up.ChannelHeader.GetTxId())
+		}
 	}
 
 	// check ACL only for application chaincodes; ACLs

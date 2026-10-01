@@ -74,6 +74,22 @@ var (
 		LabelNames:   []string{"channel", "chaincode"},
 		StatsdFormat: "%{#fqname}.%{channel}.%{chaincode}",
 	}
+
+	idempotentReplayCounterOpts = metrics.CounterOpts{
+		Namespace:    "endorser",
+		Name:         "idempotent_replays",
+		Help:         "The number of repeated endorsement requests carrying an identical payload for a transaction ID that was already seen.",
+		LabelNames:   []string{"channel", "chaincode"},
+		StatsdFormat: "%{#fqname}.%{channel}.%{chaincode}",
+	}
+
+	idempotencyConflictCounterOpts = metrics.CounterOpts{
+		Namespace:    "endorser",
+		Name:         "idempotency_conflicts",
+		Help:         "The number of endorsement requests rejected because their transaction ID was already used with a different payload.",
+		LabelNames:   []string{"channel", "chaincode"},
+		StatsdFormat: "%{#fqname}.%{channel}.%{chaincode}",
+	}
 )
 
 type Metrics struct {
@@ -86,6 +102,8 @@ type Metrics struct {
 	EndorsementsFailed       metrics.Counter
 	DuplicateTxsFailure      metrics.Counter
 	SimulationFailure        metrics.Counter
+	IdempotentReplays        metrics.Counter
+	IdempotencyConflicts     metrics.Counter
 }
 
 func NewMetrics(p metrics.Provider) *Metrics {
@@ -99,5 +117,7 @@ func NewMetrics(p metrics.Provider) *Metrics {
 		EndorsementsFailed:       p.NewCounter(endorsementFailureCounterOpts),
 		DuplicateTxsFailure:      p.NewCounter(duplicateTxsFailureCounterOpts),
 		SimulationFailure:        p.NewCounter(simulationFailureCounterOpts),
+		IdempotentReplays:        p.NewCounter(idempotentReplayCounterOpts),
+		IdempotencyConflicts:     p.NewCounter(idempotencyConflictCounterOpts),
 	}
 }
