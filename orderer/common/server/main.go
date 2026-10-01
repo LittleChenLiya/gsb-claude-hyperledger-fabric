@@ -204,6 +204,8 @@ func Main() {
 		conf.General.Authentication.TimeWindow,
 		mutualTLS,
 		conf.General.Authentication.NoExpirationChecks,
+		conf.Broadcast.ValidateTimeout,
+		conf.Broadcast.OrderTimeout,
 	)
 
 	logger.Infof("Starting %s", metadata.GetVersionInfo())

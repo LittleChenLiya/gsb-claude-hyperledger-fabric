@@ -336,3 +336,23 @@ Consensus:
   # SnapDir specifies the location at which snapshots for etcd/raft are
   # stored. Each channel will have its own subdir named after channel ID.
   SnapDir: /var/hyperledger/production/orderer/etcdraft/snapshot
+
+################################################################################
+#
+#   Broadcast Configuration
+#
+#   - This section contains config options for the broadcast API.
+#
+################################################################################
+Broadcast:
+  # ValidateTimeout bounds the time spent validating a single message.
+  # If validation does not complete within this duration, the broadcast
+  # returns a validation timeout status. A zero value falls back to the
+  # broadcast package default.
+  ValidateTimeout: 30s
+
+  # OrderTimeout bounds the time spent enqueuing a single message to the
+  # consenter. If ordering does not complete within this duration, the
+  # broadcast returns an ordering timeout status. A zero value falls back
+  # to the broadcast package default.
+  OrderTimeout: 30s

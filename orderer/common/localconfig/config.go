@@ -29,6 +29,17 @@ type TopLevel struct {
 	Metrics              Metrics
 	ChannelParticipation ChannelParticipation
 	Admin                Admin
+	Broadcast            Broadcast
+}
+
+// Broadcast contains configuration for the broadcast API.
+type Broadcast struct {
+	// ValidateTimeout bounds the time spent validating a single message.
+	// A zero value falls back to the broadcast package default.
+	ValidateTimeout time.Duration
+	// OrderTimeout bounds the time spent enqueuing a single message to the
+	// consenter. A zero value falls back to the broadcast package default.
+	OrderTimeout time.Duration
 }
 
 // General contains config which should be common among all orderer types.
@@ -223,6 +234,10 @@ var Defaults = TopLevel{
 	Admin: Admin{
 		ListenAddress: "127.0.0.1:0",
 	},
+	Broadcast: Broadcast{
+		ValidateTimeout: 30 * time.Second,
+		OrderTimeout:    30 * time.Second,
+	},
 }
 
 // Load parses the orderer YAML file and environment, producing
@@ -369,6 +384,12 @@ func (c *TopLevel) completeInitialization(configDir string) {
 		case c.General.Throttling.InactivityTimeout == 0:
 			logger.Infof("General.Throttling.InactivityTimeout is unset, setting to %v", Defaults.General.Throttling.InactivityTimeout)
 			c.General.Throttling.InactivityTimeout = Defaults.General.Throttling.InactivityTimeout
+		case c.Broadcast.ValidateTimeout == 0:
+			logger.Infof("Broadcast.ValidateTimeout is unset, setting to %v", Defaults.Broadcast.ValidateTimeout)
+			c.Broadcast.ValidateTimeout = Defaults.Broadcast.ValidateTimeout
+		case c.Broadcast.OrderTimeout == 0:
+			logger.Infof("Broadcast.OrderTimeout is unset, setting to %v", Defaults.Broadcast.OrderTimeout)
+			c.Broadcast.OrderTimeout = Defaults.Broadcast.OrderTimeout
 		default:
 			return
 		}

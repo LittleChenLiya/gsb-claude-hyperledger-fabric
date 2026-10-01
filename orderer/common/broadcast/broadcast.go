@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package broadcast
 
 import (
+	"context"
 	errors2 "errors"
 	"io"
 	"time"
@@ -20,6 +21,24 @@ import (
 )
 
 var logger = flogging.MustGetLogger("orderer.common.broadcast")
+
+// Default timeouts applied to the validation and ordering phases when the
+// Handler is constructed without explicit values.
+const (
+	DefaultValidateTimeout = 30 * time.Second
+	DefaultOrderTimeout    = 30 * time.Second
+)
+
+// Distinguishable status codes returned when the validation or ordering phase
+// of broadcast processing does not complete within its allotted timeout.
+const (
+	// StatusValidationTimeout indicates that the message validator did not
+	// complete within the configured validation timeout.
+	StatusValidationTimeout = cb.Status(504)
+	// StatusOrderingTimeout indicates that the consenter did not complete the
+	// order (or configure) operation within the configured ordering timeout.
+	StatusOrderingTimeout = cb.Status(505)
+)
 
 //go:generate counterfeiter -o mock/channel_support_registrar.go --fake-name ChannelSupportRegistrar . ChannelSupportRegistrar
 
@@ -61,11 +80,32 @@ type Consenter interface {
 type Handler struct {
 	SupportRegistrar ChannelSupportRegistrar
 	Metrics          *Metrics
+	// ValidateTimeout bounds the time spent validating a single message.
+	// A zero value applies DefaultValidateTimeout.
+	ValidateTimeout time.Duration
+	// OrderTimeout bounds the time spent enqueuing a single message to the
+	// consenter. A zero value applies DefaultOrderTimeout.
+	OrderTimeout time.Duration
+}
+
+func (bh *Handler) validateTimeout() time.Duration {
+	if bh.ValidateTimeout > 0 {
+		return bh.ValidateTimeout
+	}
+	return DefaultValidateTimeout
+}
+
+func (bh *Handler) orderTimeout() time.Duration {
+	if bh.OrderTimeout > 0 {
+		return bh.OrderTimeout
+	}
+	return DefaultOrderTimeout
 }
 
 // Handle reads requests from a Broadcast stream, processes them, and returns the responses to the stream
 func (bh *Handler) Handle(srv ab.AtomicBroadcast_BroadcastServer) error {
-	addr := util.ExtractRemoteAddress(srv.Context())
+	ctx := srv.Context()
+	addr := util.ExtractRemoteAddress(ctx)
 	logger.Debugf("Starting new broadcast loop for %s", addr)
 	for {
 		msg, err := srv.Recv()
@@ -78,7 +118,14 @@ func (bh *Handler) Handle(srv ab.AtomicBroadcast_BroadcastServer) error {
 			return err
 		}
 
-		resp := bh.ProcessMessage(msg, addr)
+		resp, ok := bh.ProcessMessage(ctx, msg, addr)
+		if !ok {
+			// The client context was canceled while the message was being
+			// processed; the stream is no longer usable, so stop waiting and
+			// do not send a response.
+			logger.Debugf("Context canceled while processing message from %s, stopping broadcast loop", addr)
+			return nil
+		}
 		err = srv.Send(resp)
 		if resp.GetStatus() != cb.Status_SUCCESS {
 			return err
@@ -102,7 +149,7 @@ type MetricsTracker struct {
 
 func (mt *MetricsTracker) Record(resp *ab.BroadcastResponse) {
 	labels := []string{
-		"status", resp.GetStatus().String(),
+		"status", StatusName(resp.GetStatus()),
 		"channel", mt.ChannelID,
 		"type", mt.TxType,
 	}
@@ -120,6 +167,20 @@ func (mt *MetricsTracker) Record(resp *ab.BroadcastResponse) {
 	mt.Metrics.ProcessedCount.With(labels...).Add(1)
 }
 
+// StatusName returns a stable label value for a status code. The proto
+// generated enum only knows the built-in statuses, so the timeout categories
+// are mapped to descriptive names here.
+func StatusName(status cb.Status) string {
+	switch status {
+	case StatusValidationTimeout:
+		return "VALIDATION_TIMEOUT"
+	case StatusOrderingTimeout:
+		return "ORDERING_TIMEOUT"
+	default:
+		return status.String()
+	}
+}
+
 func (mt *MetricsTracker) BeginValidate() {
 	mt.ValidateStartTime = time.Now()
 }
@@ -132,8 +193,10 @@ func (mt *MetricsTracker) BeginEnqueue() {
 	mt.EnqueueStartTime = time.Now()
 }
 
-// ProcessMessage validates and enqueues a single message
-func (bh *Handler) ProcessMessage(msg *cb.Envelope, addr string) (resp *ab.BroadcastResponse) {
+// ProcessMessage validates and enqueues a single message. The returned ok
+// flag is false when the client context was canceled while the message was
+// being processed; in that case no response should be sent.
+func (bh *Handler) ProcessMessage(ctx context.Context, msg *cb.Envelope, addr string) (resp *ab.BroadcastResponse, ok bool) {
 	tracker := &MetricsTracker{
 		ChannelID: "unknown",
 		TxType:    "unknown",
@@ -142,8 +205,11 @@ func (bh *Handler) ProcessMessage(msg *cb.Envelope, addr string) (resp *ab.Broad
 	defer func() {
 		// This looks a little unnecessary, but if done directly as
 		// a defer, resp gets the (always nil) current state of resp
-		// and not the return value
-		tracker.Record(resp)
+		// and not the return value. When the client context is canceled
+		// resp is nil and no response is sent, so there is nothing to record.
+		if resp != nil {
+			tracker.Record(resp)
+		}
 	}()
 	tracker.BeginValidate()
 
@@ -154,56 +220,138 @@ func (bh *Handler) ProcessMessage(msg *cb.Envelope, addr string) (resp *ab.Broad
 	}
 	if err != nil {
 		logger.Warningf("[channel: %s] Could not get message processor for serving %s: %s", tracker.ChannelID, addr, err)
-		return &ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST, Info: err.Error()}
+		return &ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST, Info: err.Error()}, true
 	}
 
 	if !isConfig {
 		logger.Debugf("[channel: %s] Broadcast is processing normal message from %s with txid '%s' of type %s", chdr.GetChannelId(), addr, chdr.GetTxId(), cb.HeaderType_name[chdr.GetType()])
 
-		configSeq, err := processor.ProcessNormalMsg(msg)
+		configSeq, err := runWithTimeout(ctx, bh.validateTimeout(), func() (uint64, error) {
+			return processor.ProcessNormalMsg(msg)
+		})
 		if err != nil {
+			if errors2.Is(err, context.DeadlineExceeded) {
+				logger.Warningf("[channel: %s] Validation timeout for message from %s", chdr.GetChannelId(), addr)
+				return &ab.BroadcastResponse{Status: StatusValidationTimeout, Info: "validation timeout"}, true
+			}
+			if errors2.Is(err, context.Canceled) {
+				logger.Debugf("[channel: %s] Context canceled during validation of message from %s", chdr.GetChannelId(), addr)
+				return nil, false
+			}
 			logger.Warningf("[channel: %s] Rejecting broadcast of normal message from %s because of error: %s", chdr.GetChannelId(), addr, err)
-			return &ab.BroadcastResponse{Status: ClassifyError(err), Info: err.Error()}
+			return &ab.BroadcastResponse{Status: ClassifyError(err), Info: err.Error()}, true
 		}
 		tracker.EndValidate()
 
 		tracker.BeginEnqueue()
 		if err = processor.WaitReady(); err != nil {
 			logger.Warningf("[channel: %s] Rejecting broadcast of message from %s with SERVICE_UNAVAILABLE: rejected by Consenter: %s", chdr.GetChannelId(), addr, err)
-			return &ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE, Info: err.Error()}
+			return &ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE, Info: err.Error()}, true
 		}
 
-		err = processor.Order(msg, configSeq)
+		_, err = runWithTimeout(ctx, bh.orderTimeout(), func() (any, error) {
+			return nil, processor.Order(msg, configSeq)
+		})
 		if err != nil {
+			if errors2.Is(err, context.DeadlineExceeded) {
+				logger.Warningf("[channel: %s] Ordering timeout for message from %s", chdr.GetChannelId(), addr)
+				return &ab.BroadcastResponse{Status: StatusOrderingTimeout, Info: "ordering timeout"}, true
+			}
+			if errors2.Is(err, context.Canceled) {
+				logger.Debugf("[channel: %s] Context canceled during ordering of message from %s", chdr.GetChannelId(), addr)
+				return nil, false
+			}
 			logger.Warningf("[channel: %s] Rejecting broadcast of normal message from %s with SERVICE_UNAVAILABLE: rejected by Order: %s", chdr.GetChannelId(), addr, err)
-			return &ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE, Info: err.Error()}
+			return &ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE, Info: err.Error()}, true
 		}
 	} else { // isConfig
 		logger.Debugf("[channel: %s] Broadcast is processing config update message from %s", chdr.GetChannelId(), addr)
 
-		config, configSeq, err := processor.ProcessConfigUpdateMsg(msg)
+		result, err := runWithTimeout(ctx, bh.validateTimeout(), func() (configUpdateResult, error) {
+			config, configSeq, err := processor.ProcessConfigUpdateMsg(msg)
+			return configUpdateResult{config: config, configSeq: configSeq}, err
+		})
 		if err != nil {
+			if errors2.Is(err, context.DeadlineExceeded) {
+				logger.Warningf("[channel: %s] Validation timeout for config message from %s", chdr.GetChannelId(), addr)
+				return &ab.BroadcastResponse{Status: StatusValidationTimeout, Info: "validation timeout"}, true
+			}
+			if errors2.Is(err, context.Canceled) {
+				logger.Debugf("[channel: %s] Context canceled during validation of config message from %s", chdr.GetChannelId(), addr)
+				return nil, false
+			}
 			logger.Warningf("[channel: %s] Rejecting broadcast of config message from %s because of error: %s", chdr.GetChannelId(), addr, err)
-			return &ab.BroadcastResponse{Status: ClassifyError(err), Info: err.Error()}
+			return &ab.BroadcastResponse{Status: ClassifyError(err), Info: err.Error()}, true
 		}
 		tracker.EndValidate()
 
 		tracker.BeginEnqueue()
 		if err = processor.WaitReady(); err != nil {
 			logger.Warningf("[channel: %s] Rejecting broadcast of message from %s with SERVICE_UNAVAILABLE: rejected by Consenter: %s", chdr.GetChannelId(), addr, err)
-			return &ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE, Info: err.Error()}
+			return &ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE, Info: err.Error()}, true
 		}
 
-		err = processor.Configure(config, configSeq)
+		_, err = runWithTimeout(ctx, bh.orderTimeout(), func() (any, error) {
+			return nil, processor.Configure(result.config, result.configSeq)
+		})
 		if err != nil {
+			if errors2.Is(err, context.DeadlineExceeded) {
+				logger.Warningf("[channel: %s] Ordering timeout for config message from %s", chdr.GetChannelId(), addr)
+				return &ab.BroadcastResponse{Status: StatusOrderingTimeout, Info: "ordering timeout"}, true
+			}
+			if errors2.Is(err, context.Canceled) {
+				logger.Debugf("[channel: %s] Context canceled during ordering of config message from %s", chdr.GetChannelId(), addr)
+				return nil, false
+			}
 			logger.Warningf("[channel: %s] Rejecting broadcast of config message from %s with SERVICE_UNAVAILABLE: rejected by Configure: %s", chdr.GetChannelId(), addr, err)
-			return &ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE, Info: err.Error()}
+			return &ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE, Info: err.Error()}, true
 		}
 	}
 
 	logger.Debugf("[channel: %s] Broadcast has successfully enqueued message of type %s from %s", chdr.GetChannelId(), cb.HeaderType_name[chdr.GetType()], addr)
 
-	return &ab.BroadcastResponse{Status: cb.Status_SUCCESS}
+	return &ab.BroadcastResponse{Status: cb.Status_SUCCESS}, true
+}
+
+// timeoutResult pairs the result of a blocking operation with its error.
+type timeoutResult[T any] struct {
+	value T
+	err   error
+}
+
+// configUpdateResult pairs the outputs of ProcessConfigUpdateMsg.
+type configUpdateResult struct {
+	config    *cb.Envelope
+	configSeq uint64
+}
+
+// runWithTimeout runs fn in a goroutine and waits for it to complete, for the
+// timeout to expire, or for the context to be canceled. When the timeout
+// expires or the context is canceled, the returned error wraps the context
+// error. The goroutine running fn is not killed; it is expected to finish on
+// its own and send its result to the buffered channel, which is then garbage
+// collected.
+func runWithTimeout[T any](ctx context.Context, timeout time.Duration, fn func() (T, error)) (T, error) {
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	resultCh := make(chan timeoutResult[T], 1)
+	go func() {
+		v, err := fn()
+		resultCh <- timeoutResult[T]{value: v, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		return result.value, result.err
+	case <-runCtx.Done():
+		var zero T
+		return zero, runCtx.Err()
+	}
 }
 
 // ClassifyError converts an error type into a status code.
