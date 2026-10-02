@@ -65,22 +65,18 @@ type requestResponse struct {
 // It returns an error if the specified block number is smaller than the last committed block number
 // or the requested block number already exists.
 func (l *kvLedger) SubmitSnapshotRequest(blockNumber uint64) error {
-	l.snapshotMgr.events <- &event{requestAdd, blockNumber}
-	response := <-l.snapshotMgr.requestResponses
-	return response.err
+	return l.snapshotMgr.submitRequest(requestAdd, blockNumber)
 }
 
 // CancelSnapshotRequest cancels the previously submitted request.
 // It returns an error if such a request does not exist or is under processing.
 func (l *kvLedger) CancelSnapshotRequest(blockNumber uint64) error {
-	l.snapshotMgr.events <- &event{requestCancel, blockNumber}
-	response := <-l.snapshotMgr.requestResponses
-	return response.err
+	return l.snapshotMgr.submitRequest(requestCancel, blockNumber)
 }
 
 // PendingSnapshotRequests returns a list of block numbers for the pending (or under processing) snapshot requests.
 func (l *kvLedger) PendingSnapshotRequests() ([]uint64, error) {
-	return l.snapshotMgr.snapshotRequestBookkeeper.list()
+	return l.snapshotMgr.pendingRequests()
 }
 
 // processSnapshotMgmtEvents handles each event in the events channel and performs synchronization across
@@ -105,9 +101,10 @@ func (l *kvLedger) processSnapshotMgmtEvents(lastCommittedBlockNumber uint64) {
 	// and set to false when snapshotDone event is received
 	snapshotInProgress := false
 
-	events := l.snapshotMgr.events
-	commitProceed := l.snapshotMgr.commitProceed
-	requestResponses := l.snapshotMgr.requestResponses
+	mgr := l.snapshotMgr.(*snapshotMgr)
+	events := mgr.events
+	commitProceed := mgr.commitProceed
+	requestResponses := mgr.requestResponses
 
 	for {
 		e := <-events
@@ -131,7 +128,7 @@ func (l *kvLedger) processSnapshotMgmtEvents(lastCommittedBlockNumber uint64) {
 		case commitDone:
 			lastCommittedBlockNumber = e.blockNumber
 			committerStatus = idle
-			if lastCommittedBlockNumber != l.snapshotMgr.snapshotRequestBookkeeper.smallestRequestBlockNum {
+			if lastCommittedBlockNumber != mgr.snapshotRequestBookkeeper.smallestRequestBlockNum {
 				continue
 			}
 			snapshotInProgress = true
@@ -147,7 +144,7 @@ func (l *kvLedger) processSnapshotMgmtEvents(lastCommittedBlockNumber uint64) {
 
 		case snapshotDone:
 			requestedBlockNum := e.blockNumber
-			if err := l.snapshotMgr.snapshotRequestBookkeeper.delete(e.blockNumber); err != nil {
+			if err := mgr.snapshotRequestBookkeeper.delete(e.blockNumber); err != nil {
 				logger.Errorw("Failed to delete snapshot request, the pending snapshot requests (if any) may not be processed", "channelID", l.ledgerID, "requestedBlockNum", requestedBlockNum, "error", err)
 			}
 			if committerStatus == blocked {
@@ -188,7 +185,7 @@ func (l *kvLedger) processSnapshotMgmtEvents(lastCommittedBlockNumber uint64) {
 				}
 			}
 
-			if err := l.snapshotMgr.snapshotRequestBookkeeper.add(requestedBlockNum); err != nil {
+			if err := mgr.snapshotRequestBookkeeper.add(requestedBlockNum); err != nil {
 				requestResponses <- &requestResponse{err}
 				continue
 			}
@@ -213,7 +210,7 @@ func (l *kvLedger) processSnapshotMgmtEvents(lastCommittedBlockNumber uint64) {
 				requestResponses <- &requestResponse{errors.Errorf("cannot cancel the snapshot request because it is under processing")}
 				continue
 			}
-			requestResponses <- &requestResponse{l.snapshotMgr.snapshotRequestBookkeeper.delete(requestedBlockNum)}
+			requestResponses <- &requestResponse{mgr.snapshotRequestBookkeeper.delete(requestedBlockNum)}
 
 		case snapshotMgrShutdown:
 			return
@@ -222,7 +219,8 @@ func (l *kvLedger) processSnapshotMgmtEvents(lastCommittedBlockNumber uint64) {
 }
 
 func (l *kvLedger) regenrateMissedSnapshot(blockNumber uint64) error {
-	if blockNumber != l.snapshotMgr.snapshotRequestBookkeeper.smallestRequestBlockNum {
+	mgr := l.snapshotMgr.(*snapshotMgr)
+	if blockNumber != mgr.snapshotRequestBookkeeper.smallestRequestBlockNum {
 		return nil
 	}
 	exists, err := l.snapshotExists(blockNumber)
@@ -231,7 +229,7 @@ func (l *kvLedger) regenrateMissedSnapshot(blockNumber uint64) error {
 	}
 	if !exists {
 		// send commitDone event to generate the missing snapshot
-		l.snapshotMgr.events <- &event{typ: commitDone, blockNumber: blockNumber}
+		mgr.events <- &event{typ: commitDone, blockNumber: blockNumber}
 	}
 	return nil
 }
@@ -247,6 +245,29 @@ func (l *kvLedger) snapshotExists(blockNum uint64) (bool, error) {
 		return false, err
 	}
 	return stat != nil, nil
+}
+
+// commitStart notifies the snapshot event loop that a block commit is about to begin and
+// blocks until the event loop allows the commit to proceed (e.g. when no snapshot is
+// being generated).
+func (m *snapshotMgr) commitStart(blockNumber uint64) {
+	m.events <- &event{commitStart, blockNumber}
+	<-m.commitProceed
+}
+
+// commitDone notifies the snapshot event loop that a block commit has finished.
+func (m *snapshotMgr) commitDone(blockNumber uint64) {
+	m.events <- &event{commitDone, blockNumber}
+}
+
+func (m *snapshotMgr) submitRequest(typ eventType, blockNumber uint64) error {
+	m.events <- &event{typ, blockNumber}
+	response := <-m.requestResponses
+	return response.err
+}
+
+func (m *snapshotMgr) pendingRequests() ([]uint64, error) {
+	return m.snapshotRequestBookkeeper.list()
 }
 
 // shutdown sends a snapshotMgrShutdown event and close all the channels, which is called

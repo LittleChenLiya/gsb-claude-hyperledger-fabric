@@ -30,10 +30,18 @@ func newMetadataHint(bookkeeper *leveldbhelper.DBHandle) (*metadataHint, error) 
 }
 
 func (h *metadataHint) metadataEverUsedFor(namespace string) bool {
+	if h == nil {
+		// without a persistent hint, metadata usage is unknown
+		return false
+	}
 	return h.cache[namespace]
 }
 
 func (h *metadataHint) setMetadataUsedFlag(updates *UpdateBatch) error {
+	if h == nil {
+		// no persistent metadata hint bookkeeping is configured
+		return nil
+	}
 	batch := h.bookkeeper.NewUpdateBatch()
 	for ns := range filterNamespacesThatHasMetadata(updates) {
 		if h.cache[ns] {
@@ -46,6 +54,10 @@ func (h *metadataHint) setMetadataUsedFlag(updates *UpdateBatch) error {
 }
 
 func (h *metadataHint) importNamespacesThatUseMetadata(namespaces map[string]struct{}) error {
+	if h == nil {
+		// no persistent metadata hint bookkeeping is configured
+		return nil
+	}
 	batch := h.bookkeeper.NewUpdateBatch()
 	for ns := range namespaces {
 		batch.Put([]byte(ns), []byte{})

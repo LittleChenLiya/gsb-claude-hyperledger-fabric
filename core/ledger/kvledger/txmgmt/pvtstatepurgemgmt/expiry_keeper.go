@@ -11,6 +11,7 @@ import (
 	"github.com/hyperledger/fabric/common/ledger/util"
 	"github.com/hyperledger/fabric/common/ledger/util/leveldbhelper"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/bookkeeping"
+	"github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -40,6 +41,13 @@ type expiryInfoKey struct {
 }
 
 func newExpiryKeeper(ledgerid string, provider *bookkeeping.Provider) *expiryKeeper {
+	if provider == nil {
+		// A nil provider means that no persistent expiry bookkeeping is desired.
+		// This is used, for instance, by tests that construct a fully in-memory
+		// ledger. The keeper then operates in a no-op mode and never expires
+		// private data.
+		return &expiryKeeper{}
+	}
 	return &expiryKeeper{provider.GetDBHandle(ledgerid, bookkeeping.PvtdataExpiry)}
 }
 
@@ -56,6 +64,10 @@ func newExpiryKeeper(ledgerid string, provider *bookkeeping.Provider) *expiryKee
 // at the time of the commit of the block number 45 and the second entry was created at the time of the commit of the block number 40, however
 // both are expiring with the commit of block number 50.
 func (ek *expiryKeeper) update(toTrack []*expiryInfo, toClear []*expiryInfoKey) error {
+	if ek.db == nil {
+		// no persistent expiry bookkeeping is configured
+		return nil
+	}
 	updateBatch := ek.db.NewUpdateBatch()
 	for _, expinfo := range toTrack {
 		k, v, err := encodeKV(expinfo)
@@ -72,6 +84,10 @@ func (ek *expiryKeeper) update(toTrack []*expiryInfo, toClear []*expiryInfoKey) 
 
 // retrieve returns the keys info that are supposed to be expired by the given block number
 func (ek *expiryKeeper) retrieve(expiringAtBlkNum uint64) ([]*expiryInfo, error) {
+	if ek.db == nil {
+		// no persistent expiry bookkeeping is configured
+		return nil, nil
+	}
 	startKey := encodeExpiryInfoKey(&expiryInfoKey{expiryBlk: expiringAtBlkNum, committingBlk: 0})
 	endKey := encodeExpiryInfoKey(&expiryInfoKey{expiryBlk: expiringAtBlkNum + 1, committingBlk: 0})
 	itr, err := ek.db.GetIterator(startKey, endKey)
@@ -93,6 +109,9 @@ func (ek *expiryKeeper) retrieve(expiringAtBlkNum uint64) ([]*expiryInfo, error)
 
 // retrieveByExpiryKey retrieves the expiryInfo for given expiryKey
 func (ek *expiryKeeper) retrieveByExpiryKey(expiryKey *expiryInfoKey) (*expiryInfo, error) {
+	if ek.db == nil {
+		return nil, errors.New("private data expiry bookkeeping is not available")
+	}
 	key := encodeExpiryInfoKey(expiryKey)
 	value, err := ek.db.Get(key)
 	if err != nil {

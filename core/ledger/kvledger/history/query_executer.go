@@ -10,7 +10,6 @@ import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/queryresult"
 	commonledger "github.com/hyperledger/fabric/common/ledger"
-	"github.com/hyperledger/fabric/common/ledger/blkstorage"
 	"github.com/hyperledger/fabric/common/ledger/util/leveldbhelper"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	"github.com/hyperledger/fabric/protoutil"
@@ -18,10 +17,16 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 )
 
+// blockStoreReader provides the block storage access required by the history query
+// executor. Both *blkstorage.BlockStore and in-memory test block stores satisfy it.
+type blockStoreReader interface {
+	RetrieveTxByBlockNumTranNum(blockNum uint64, tranNum uint64) (*common.Envelope, error)
+}
+
 // QueryExecutor is a query executor against the LevelDB history DB
 type QueryExecutor struct {
 	levelDB    *leveldbhelper.DBHandle
-	blockStore *blkstorage.BlockStore
+	blockStore blockStoreReader
 }
 
 // GetHistoryForKey implements method in interface `ledger.HistoryQueryExecutor`
@@ -47,7 +52,7 @@ type historyScanner struct {
 	namespace  string
 	key        string
 	dbItr      iterator.Iterator
-	blockStore *blkstorage.BlockStore
+	blockStore blockStoreReader
 }
 
 // Next iterates to the next key, in the order of newest to oldest, from history scanner.

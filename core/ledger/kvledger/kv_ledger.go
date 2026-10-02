@@ -19,7 +19,7 @@ import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	commonledger "github.com/hyperledger/fabric/common/ledger"
-	"github.com/hyperledger/fabric/common/ledger/blkstorage"
+	"github.com/hyperledger/fabric/common/ledger/snapshot"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/cceventmgmt"
@@ -46,20 +46,66 @@ var (
 	snapshotHashOpts = &bccsp.SHA256Opts{}
 )
 
+// blockStore encapsulates the block storage operations used by a kvLedger. The production
+// implementation is *blkstorage.BlockStore; test implementations may keep the blocks in
+// memory.
+type blockStore interface {
+	AddBlock(block *common.Block) error
+	GetBlockchainInfo() (*common.BlockchainInfo, error)
+	RetrieveBlocks(startNum uint64) (commonledger.ResultsIterator, error)
+	RetrieveBlockByHash(blockHash []byte) (*common.Block, error)
+	RetrieveBlockByNumber(blockNum uint64) (*common.Block, error)
+	RetrieveBlockByTxID(txID string) (*common.Block, error)
+	RetrieveTxByID(txID string) (*common.Envelope, error)
+	RetrieveTxByBlockNumTranNum(blockNum uint64, txNum uint64) (*common.Envelope, error)
+	RetrieveTxValidationCodeByTxID(txID string) (peer.TxValidationCode, uint64, error)
+	TxIDExists(txID string) (bool, error)
+	ExportTxIds(dir string, newHashFunc snapshot.NewHashFunc) (map[string][]byte, error)
+	Shutdown()
+}
+
+// pvtDataStore encapsulates the private data storage operations used by a kvLedger. The
+// production implementation is *pvtdatastorage.Store; test implementations may keep the
+// data in memory.
+type pvtDataStore interface {
+	Init(btlPolicy pvtdatapolicy.BTLPolicy)
+	LastCommittedBlockHeight() (uint64, error)
+	Commit(blockNum uint64, pvtData []*ledger.TxPvtData, missingPvtData ledger.TxMissingPvtData, purgeMarkers []*pvtdatastorage.PurgeMarker) error
+	GetPvtDataByBlockNum(blockNum uint64, filter ledger.PvtNsCollFilter) ([]*ledger.TxPvtData, error)
+	GetLastUpdatedOldBlocksPvtData() (map[uint64][]*ledger.TxPvtData, error)
+	ResetLastUpdatedOldBlocksList() error
+	FetchPrivateDataRawKey(ns, coll string, keyHash []byte) (string, error)
+	CommitPvtDataOfOldBlocks(blocksPvtData map[uint64][]*ledger.TxPvtData, unreconciled ledger.MissingPvtDataInfo) error
+	GetMissingPvtDataInfoForMostRecentBlocks(startingBlockNum uint64, maxBlock int) (ledger.MissingPvtDataInfo, error)
+	FetchBootKVHashes(blkNum, txNum uint64, ns, coll string) (map[string][]byte, error)
+	RemoveAppInitiatedPurgesUsingReconMarker(kvHashes map[string][]byte, ns, coll string, blkNum, txNum uint64) (map[string][]byte, error)
+}
+
+// commitSync synchronizes a block commit with snapshot generation. The production
+// implementation is *snapshotMgr; a test implementation may simply allow every commit to
+// proceed.
+type commitSync interface {
+	commitStart(blockNumber uint64)
+	commitDone(blockNumber uint64)
+	submitRequest(typ eventType, blockNumber uint64) error
+	pendingRequests() ([]uint64, error)
+	shutdown()
+}
+
 // kvLedger provides an implementation of `ledger.PeerLedger`.
 // This implementation provides a key-value based data model
 type kvLedger struct {
 	ledgerID             string
 	bootSnapshotMetadata *SnapshotMetadata
-	blockStore           *blkstorage.BlockStore
+	blockStore           blockStore
 
 	pvtdataStoreLock sync.Mutex
-	pvtdataStore     *pvtdatastorage.Store
+	pvtdataStore     pvtDataStore
 
 	txmgr                  *txmgr.LockBasedTxMgr
 	historyDB              *history.DB
 	configHistoryRetriever *collectionConfigHistoryRetriever
-	snapshotMgr            *snapshotMgr
+	snapshotMgr            commitSync
 	// this RWMutex provides atomicity to commit a block to the block-storage
 	// and to apply its effects on the state database
 	//
@@ -83,8 +129,8 @@ type lgrInitializer struct {
 	ledgerID                 string
 	initializingFromSnapshot bool
 	bootSnapshotMetadata     *SnapshotMetadata
-	blockStore               *blkstorage.BlockStore
-	pvtdataStore             *pvtdatastorage.Store
+	blockStore               blockStore
+	pvtdataStore             pvtDataStore
 	stateDB                  *privacyenabledstate.DB
 	historyDB                *history.DB
 	configHistoryMgr         *confighistory.Mgr
@@ -96,6 +142,12 @@ type lgrInitializer struct {
 	customTxProcessors       map[common.HeaderType]ledger.CustomTxProcessor
 	hashProvider             ledger.HashProvider
 	config                   *ledger.Config
+
+	// The following optional fields allow tests to inject fully in-memory
+	// implementations instead of the leveldb-backed default components. When
+	// left unset, newKVLedger constructs the production implementations.
+	configHistoryRetriever *collectionConfigHistoryRetriever
+	snapshotMgr            commitSync
 }
 
 func newKVLedger(initializer *lgrInitializer) (*kvLedger, error) {
@@ -174,10 +226,14 @@ func newKVLedger(initializer *lgrInitializer) (*kvLedger, error) {
 	if err := l.recoverDBs(); err != nil {
 		return nil, err
 	}
-	l.configHistoryRetriever = &collectionConfigHistoryRetriever{
-		Retriever:                     initializer.configHistoryMgr.GetRetriever(ledgerID),
-		DeployedChaincodeInfoProvider: txmgrInitializer.CCInfoProvider,
-		ledger:                        l,
+	if initializer.configHistoryRetriever != nil {
+		l.configHistoryRetriever = initializer.configHistoryRetriever
+	} else {
+		l.configHistoryRetriever = &collectionConfigHistoryRetriever{
+			Retriever:                     initializer.configHistoryMgr.GetRetriever(ledgerID),
+			DeployedChaincodeInfoProvider: txmgrInitializer.CCInfoProvider,
+			ledger:                        l,
+		}
 	}
 
 	if err := l.initSnapshotMgr(initializer); err != nil {
@@ -287,6 +343,11 @@ func (l *kvLedger) initTxMgr(initializer *txmgr.Initializer) error {
 }
 
 func (l *kvLedger) initSnapshotMgr(initializer *lgrInitializer) error {
+	if initializer.snapshotMgr != nil {
+		l.snapshotMgr = initializer.snapshotMgr
+		return nil
+	}
+
 	dbHandle := initializer.bookkeeperProvider.GetDBHandle(l.ledgerID, bookkeeping.SnapshotRequest)
 	bookkeeper, err := newSnapshotRequestBookkeeper(l.ledgerID, dbHandle)
 	if err != nil {
@@ -600,22 +661,58 @@ func (l *kvLedger) NewHistoryQueryExecutor() (ledger.HistoryQueryExecutor, error
 	return nil, nil
 }
 
+// PrecheckReadSetConflicts implements the optional interface ledger.ReadSetPrechecker. It
+// performs a read-only precheck of the transaction read-sets in the candidate block
+// against the latest committed state. The precheck never writes to the ledger and the
+// returned report is advisory only - CommitLegacy re-runs the full MVCC validation so
+// that a state change occurring between the precheck and the commit (TOCTOU) is always
+// caught at commit time.
+func (l *kvLedger) PrecheckReadSetConflicts(pvtdataAndBlock *ledger.BlockAndPvtData) (*ledger.ReadSetPrecheckReport, error) {
+	// Block readers of block data while a block is being committed, so that a precheck can
+	// never observe a committed block without the corresponding state update (or vice versa).
+	l.blockAPIsRWLock.RLock()
+	defer l.blockAPIsRWLock.RUnlock()
+	return l.txmgr.PrecheckReadSetConflicts(pvtdataAndBlock.Block)
+}
+
+// CommitLegacy commits the block and the corresponding pvt data in an atomic operation.
+// It synchronizes commit, snapshot generation and snapshot requests via events and commitProceed channels.
+// Before committing a block, it sends a commitStart event and waits for a message from commitProceed.
+// After the block is committed, it sends a commitDone event.
+// Refer to processEvents function to understand how the channels and events work together to handle synchronization.
+//
+// When commitOpts.PrecheckReadSet is set, a read-only read-set conflict precheck is run
+// before the commit and its report is returned in the CommitResult. The precheck does not
+// write to the ledger and the commit itself re-validates all read-sets independently.
+func (l *kvLedger) CommitLegacyWithPrecheck(pvtdataAndBlock *ledger.BlockAndPvtData, commitOpts *ledger.CommitOptions) (*ledger.CommitResult, error) {
+	var result *ledger.CommitResult
+	if commitOpts.PrecheckReadSet {
+		report, err := l.PrecheckReadSetConflicts(pvtdataAndBlock)
+		if err != nil {
+			return nil, err
+		}
+		result = &ledger.CommitResult{PrecheckReport: report}
+	}
+
+	blockNumber := pvtdataAndBlock.Block.GetHeader().GetNumber()
+	l.snapshotMgr.commitStart(blockNumber)
+
+	if err := l.commit(pvtdataAndBlock, commitOpts); err != nil {
+		return result, err
+	}
+
+	l.snapshotMgr.commitDone(blockNumber)
+	return result, nil
+}
+
 // CommitLegacy commits the block and the corresponding pvt data in an atomic operation.
 // It synchronizes commit, snapshot generation and snapshot requests via events and commitProceed channels.
 // Before committing a block, it sends a commitStart event and waits for a message from commitProceed.
 // After the block is committed, it sends a commitDone event.
 // Refer to processEvents function to understand how the channels and events work together to handle synchronization.
 func (l *kvLedger) CommitLegacy(pvtdataAndBlock *ledger.BlockAndPvtData, commitOpts *ledger.CommitOptions) error {
-	blockNumber := pvtdataAndBlock.Block.GetHeader().GetNumber()
-	l.snapshotMgr.events <- &event{commitStart, blockNumber}
-	<-l.snapshotMgr.commitProceed
-
-	if err := l.commit(pvtdataAndBlock, commitOpts); err != nil {
-		return err
-	}
-
-	l.snapshotMgr.events <- &event{commitDone, blockNumber}
-	return nil
+	_, err := l.CommitLegacyWithPrecheck(pvtdataAndBlock, commitOpts)
+	return err
 }
 
 // commit commits the block and the corresponding pvt data in an atomic operation.
@@ -1128,7 +1225,7 @@ func (a *ccEventListenerAdaptor) ChaincodeDeployDone(succeeded bool) {
 
 func filterPvtDataOfInvalidTx(
 	hashVerifiedPvtData map[uint64][]*ledger.TxPvtData,
-	blockStore *blkstorage.BlockStore,
+	blockStore blockStore,
 	lastBlockInBootstrapSnapshot uint64,
 ) (map[uint64][]*ledger.TxPvtData, error) {
 	committedPvtData := make(map[uint64][]*ledger.TxPvtData)

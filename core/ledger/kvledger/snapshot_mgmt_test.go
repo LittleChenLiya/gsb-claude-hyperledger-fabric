@@ -215,7 +215,7 @@ func TestSnapshotRequests(t *testing.T) {
 	// commit blocks upto block number 25 and add a request for block number 25 to the leveldb directly
 	// snapshot should not be generated and will be recovered after the ledger is reopened
 	testutilCommitBlocks(t, l, bg, 25, protoutil.BlockHeaderHash(lastBlock.GetHeader()))
-	require.NoError(t, kvledger.snapshotMgr.snapshotRequestBookkeeper.dbHandle.Put(encodeSnapshotRequestKey(25), []byte{}, true))
+	require.NoError(t, kvledger.snapshotMgr.(*snapshotMgr).snapshotRequestBookkeeper.dbHandle.Put(encodeSnapshotRequestKey(25), []byte{}, true))
 	exists, err = kvledger.snapshotExists(25)
 	require.NoError(t, err)
 	require.False(t, exists)
@@ -263,14 +263,15 @@ func TestSnapshotMgmtConcurrency(t *testing.T) {
 
 	// Artificially, send event to background goroutine to indicate that commit for block 6 has started
 	// and then submit snapshot request for block 0, while not sending the event for commit done for block 6
-	kvledger.snapshotMgr.events <- &event{typ: commitStart, blockNumber: 6}
-	<-kvledger.snapshotMgr.commitProceed
+	mgr := kvledger.snapshotMgr.(*snapshotMgr)
+	mgr.events <- &event{typ: commitStart, blockNumber: 6}
+	<-mgr.commitProceed
 
 	require.NoError(t, kvledger.SubmitSnapshotRequest(0))
 	require.Eventually(
 		t,
 		func() bool {
-			r, err := kvledger.snapshotMgr.snapshotRequestBookkeeper.smallestRequest()
+			r, err := mgr.snapshotRequestBookkeeper.smallestRequest()
 			require.NoError(t, err)
 			return r == 6
 		},
@@ -293,21 +294,22 @@ func TestSnapshotMgrShutdown(t *testing.T) {
 	l.Close()
 
 	// verify snapshotMgr.stopped and channels are stopped
-	require.True(t, kvledger.snapshotMgr.stopped)
+	snapMgr := kvledger.snapshotMgr.(*snapshotMgr)
+	require.True(t, snapMgr.stopped)
 	require.PanicsWithError(
 		t,
 		"send on closed channel",
-		func() { kvledger.snapshotMgr.events <- &event{typ: commitStart, blockNumber: 1} },
+		func() { snapMgr.events <- &event{typ: commitStart, blockNumber: 1} },
 	)
 	require.PanicsWithError(
 		t,
 		"send on closed channel",
-		func() { kvledger.snapshotMgr.commitProceed <- struct{}{} },
+		func() { snapMgr.commitProceed <- struct{}{} },
 	)
 	require.PanicsWithError(
 		t,
 		"send on closed channel",
-		func() { kvledger.snapshotMgr.requestResponses <- &requestResponse{} },
+		func() { snapMgr.requestResponses <- &requestResponse{} },
 	)
 
 	// close ledger again is fine

@@ -203,6 +203,18 @@ func (txmgr *LockBasedTxMgr) ValidateAndPrepare(blockAndPvtdata *ledger.BlockAnd
 	return appPurgeUpdates, txstatsInfo, updateBytes, err
 }
 
+// PrecheckReadSetConflicts performs a read-only MVCC validation of the transaction
+// read-sets in the block against the latest committed state. This method never prepares
+// an update batch, invokes state listeners, or writes anything to the state database. The
+// read-write lock is taken in the shared mode so that a concurrent commit that has not
+// yet applied its updates is not observed in a partially visible state. The regular
+// commit path must still run the full validation to protect against TOCTOU races.
+func (txmgr *LockBasedTxMgr) PrecheckReadSetConflicts(block *common.Block) (*ledger.ReadSetPrecheckReport, error) {
+	txmgr.commitRWLock.RLock()
+	defer txmgr.commitRWLock.RUnlock()
+	return validation.CheckReadSetConflicts(txmgr.db, block)
+}
+
 // RemoveStaleAndCommitPvtDataOfOldBlocks implements method in interface `txmgmt.TxMgr`
 // The following six operations are performed:
 // (1) constructs the unique pvt data from the passed reconciledPvtdata

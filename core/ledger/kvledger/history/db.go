@@ -9,7 +9,6 @@ package history
 import (
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
-	"github.com/hyperledger/fabric/common/ledger/blkstorage"
 	"github.com/hyperledger/fabric/common/ledger/dataformat"
 	"github.com/hyperledger/fabric/common/ledger/util/leveldbhelper"
 	"github.com/hyperledger/fabric/core/ledger"
@@ -155,7 +154,7 @@ func (d *DB) Commit(block *common.Block) error {
 }
 
 // NewQueryExecutor implements method in HistoryDB interface
-func (d *DB) NewQueryExecutor(blockStore *blkstorage.BlockStore) (ledger.HistoryQueryExecutor, error) {
+func (d *DB) NewQueryExecutor(blockStore blockStoreReader) (ledger.HistoryQueryExecutor, error) {
 	return &QueryExecutor{d.levelDB, blockStore}, nil
 }
 

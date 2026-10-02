@@ -423,9 +423,105 @@ type BlockPvtdata struct {
 	MissingPvtData TxMissingPvtData
 }
 
+// ReadSetConflictType identifies the kind of read-set conflict detected by a commit-time precheck.
+type ReadSetConflictType int
+
+const (
+	// MVCCReadConflict indicates that a public key in the transaction's read-set has a
+	// committed version that is newer than the version observed by the transaction.
+	MVCCReadConflict ReadSetConflictType = iota
+	// PhantomReadConflict indicates that the results of a range query in the transaction's
+	// read-set would differ because of the committed state.
+	PhantomReadConflict
+)
+
+// ReadSetConflict captures the first conflicting read for a transaction.
+type ReadSetConflict struct {
+	// Type identifies whether the conflict is an MVCC read conflict or a phantom read conflict.
+	Type ReadSetConflictType
+	// Namespace is the chaincode namespace in which the conflict was detected.
+	Namespace string
+	// Key is the public key whose committed version does not match the read-set version.
+	// It is populated only for an MVCCReadConflict.
+	Key string
+	// ReadBlockNum is the block number in the key version observed by the transaction.
+	ReadBlockNum uint64
+	// ReadTxNum is the transaction number (within ReadBlockNum) observed by the transaction.
+	ReadTxNum uint64
+	// CommittedBlockNum is the block number of the version currently committed in the state database.
+	CommittedBlockNum uint64
+	// CommittedTxNum is the transaction number (within CommittedBlockNum) of the currently committed version.
+	CommittedTxNum uint64
+	// StartKey and EndKey identify the range query whose results have changed.
+	// They are populated only for a PhantomReadConflict.
+	StartKey string
+	EndKey   string
+}
+
+// TxReadSetPrecheckResult captures the read-set conflict precheck outcome for a single transaction.
+type TxReadSetPrecheckResult struct {
+	// TxIndexInBlock is the index of the transaction within the block's transactions.
+	TxIndexInBlock uint64
+	// TxID is the transaction ID read from the channel header. It may be empty for a malformed transaction.
+	TxID string
+	// Conflict is non-nil when a read-set conflict would cause the transaction to be marked invalid.
+	Conflict *ReadSetConflict
+}
+
+// ReadSetPrecheckReport is the report produced by a read-only read-set conflict precheck
+// for a candidate block. A precheck never writes to the ledger. The actual commit re-runs
+// the full MVCC validation, so the report is advisory and can become stale (TOCTOU).
+type ReadSetPrecheckReport struct {
+	// BlockNum is the number of the candidate block that was prechecked.
+	BlockNum uint64
+	// TxResults contains an entry for each endorser transaction in the block that passed the
+	// well-formedness checks. Transactions already marked invalid by the committer are skipped.
+	TxResults []*TxReadSetPrecheckResult
+}
+
+// HasConflicts reports whether the precheck found at least one read-set conflict.
+func (r *ReadSetPrecheckReport) HasConflicts() bool {
+	for _, txResult := range r.TxResults {
+		if txResult.Conflict != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// ReadSetPrechecker is an optional interface implemented by ledger implementations that
+// can perform a read-only read-set conflict precheck for a candidate block. The precheck
+// does not modify the block, the state database, the block store, or any other ledger
+// component. Callers must not rely on the report for correctness - the actual commit
+// re-validates every read-set against the committed state.
+type ReadSetPrechecker interface {
+	PrecheckReadSetConflicts(blockAndPvtdata *BlockAndPvtData) (*ReadSetPrecheckReport, error)
+}
+
+// CommitWithPrechecker is an optional interface implemented by ledger implementations
+// whose commit entry point can return an advisory read-set conflict precheck report
+// alongside the regular commit. The precheck never writes to the ledger and the commit
+// itself always re-runs the full MVCC validation to prevent TOCTOU issues.
+type CommitWithPrechecker interface {
+	CommitLegacyWithPrecheck(blockAndPvtdata *BlockAndPvtData, commitOpts *CommitOptions) (*CommitResult, error)
+}
+
 // CommitOptions encapsulates options associated with a block commit.
 type CommitOptions struct {
 	FetchPvtDataFromLedger bool
+	// PrecheckReadSet instructs the commit entry point to perform a read-only read-set
+	// conflict precheck before committing the block. The precheck report is returned in
+	// the CommitResult. The precheck result is advisory only - the commit itself always
+	// re-runs the full MVCC validation to prevent TOCTOU issues.
+	PrecheckReadSet bool
+}
+
+// CommitResult captures the outcome of a block commit, including an optional read-set
+// conflict precheck report. A non-nil PrecheckReport does not imply the commit failed -
+// conflicting transactions are marked invalid as part of the regular validation.
+type CommitResult struct {
+	// PrecheckReport is populated only when CommitOptions.PrecheckReadSet is set.
+	PrecheckReport *ReadSetPrecheckReport
 }
 
 // PvtCollFilter represents the set of the collection names (as keys of the map with value 'true')

@@ -11,11 +11,9 @@ import (
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset"
 	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset/kvrwset"
-	"github.com/hyperledger/fabric/common/ledger/blkstorage"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
-	"github.com/hyperledger/fabric/core/ledger/pvtdatastorage"
 	"github.com/hyperledger/fabric/protoutil"
 )
 
@@ -29,8 +27,8 @@ import (
 // user transaction are removed from the reconciled data
 func extractValidPvtData(
 	reconciledPvtdata []*ledger.ReconciledPvtdata,
-	blockStore *blkstorage.BlockStore,
-	pvtdataStore *pvtdatastorage.Store,
+	blockStore blockStore,
+	pvtdataStore pvtDataStore,
 	lastBlockInBootSnapshot uint64,
 ) (map[uint64][]*ledger.TxPvtData, error) {
 	validPvtData := map[uint64][]*ledger.TxPvtData{}
@@ -51,8 +49,8 @@ func extractValidPvtData(
 // extractValidPvtDataForBlock constructs valid and invalid pvt data for a block
 func extractValidPvtDataForBlock(
 	blkPvtdata *ledger.ReconciledPvtdata,
-	blockStore *blkstorage.BlockStore,
-	pvtdataStore *pvtdatastorage.Store,
+	blockStore blockStore,
+	pvtdataStore pvtDataStore,
 	lastBlockInBootSnapshot uint64,
 ) ([]*ledger.TxPvtData, error) {
 	validPvtData := []*ledger.TxPvtData{}
@@ -134,7 +132,7 @@ func extractValidPvtDataForBlock(
 // the keys that have already been purged on this peer, if any. This function returns nil if
 // the collection data should not be committed and returns a rejection reason instead.
 func validateAndRemovePurgedKeys(
-	pvtdataStore *pvtdatastorage.Store,
+	pvtdataStore pvtDataStore,
 	collPvtProto *rwset.CollectionPvtReadWriteSet,
 	kvHashes map[string][]byte,
 	collWSHashFromBlock []byte,
@@ -243,7 +241,7 @@ func retrieveCollKVHashes(txRWSet *rwsetutil.TxRwSet, ns, coll string) map[strin
 	return nil
 }
 
-func retrieveRwsetForTx(blkNum uint64, txNum uint64, blockStore *blkstorage.BlockStore) (*rwsetutil.TxRwSet, error) {
+func retrieveRwsetForTx(blkNum uint64, txNum uint64, blockStore blockStore) (*rwsetutil.TxRwSet, error) {
 	// retrieve the txEnvelope from the block store so that the hash of
 	// the pvtData can be retrieved for comparison
 	txEnvelope, err := blockStore.RetrieveTxByBlockNumTranNum(blkNum, txNum)
