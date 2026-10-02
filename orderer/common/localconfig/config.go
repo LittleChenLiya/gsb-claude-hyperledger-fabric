@@ -52,6 +52,12 @@ type General struct {
 	MaxRecvMsgSize    int32
 	MaxSendMsgSize    int32
 	Throttling        Throttling
+	// BroadcastValidateTimeout bounds the time a broadcast transaction may
+	// spend in the validation phase. Zero disables the timeout.
+	BroadcastValidateTimeout time.Duration
+	// BroadcastOrderTimeout bounds the time a broadcast transaction may
+	// spend in the ordering phase (WaitReady + enqueue). Zero disables the timeout.
+	BroadcastOrderTimeout time.Duration
 }
 
 type Cluster struct {

@@ -227,6 +227,31 @@ func TestConnectionTimeout(t *testing.T) {
 	})
 }
 
+func TestBroadcastTimeouts(t *testing.T) {
+	t.Run("without broadcast timeouts overridden they default to zero (unbounded)", func(t *testing.T) {
+		configtest.SetDevFabricConfigPath(t)
+		cc := &configCache{}
+		cfg, err := cc.load()
+		require.NotNil(t, cfg, "Could not load config")
+		require.NoError(t, err, "Load good config returned unexpected error")
+		require.Equal(t, time.Duration(0), cfg.General.BroadcastValidateTimeout)
+		require.Equal(t, time.Duration(0), cfg.General.BroadcastOrderTimeout)
+	})
+
+	t.Run("with broadcast timeouts overridden", func(t *testing.T) {
+		t.Setenv("ORDERER_GENERAL_BROADCASTVALIDATETIMEOUT", "3s")
+		t.Setenv("ORDERER_GENERAL_BROADCASTORDERTIMEOUT", "7s")
+		configtest.SetDevFabricConfigPath(t)
+
+		cc := &configCache{}
+		cfg, err := cc.load()
+		require.NotNil(t, cfg, "Could not load config")
+		require.NoError(t, err, "Load good config returned unexpected error")
+		require.Equal(t, 3*time.Second, cfg.General.BroadcastValidateTimeout)
+		require.Equal(t, 7*time.Second, cfg.General.BroadcastOrderTimeout)
+	})
+}
+
 func TestChannelParticipationDefaults(t *testing.T) {
 	configtest.SetDevFabricConfigPath(t)
 

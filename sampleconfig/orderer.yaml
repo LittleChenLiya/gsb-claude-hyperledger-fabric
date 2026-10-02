@@ -83,6 +83,15 @@ General:
     # when allocating the budget for throttling per client.
     InactivityTimeout: 5s
 
+  # Broadcast request phase timeouts. A blocked broadcast request fails fast
+  # with a distinct status once the corresponding phase budget is exhausted.
+  # A value of zero means the phase is unbounded (the historical behavior).
+  # ValidateTimeout covers transaction validation. Its expiry is reported as
+  # BAD_REQUEST. OrderTimeout covers WaitReady plus the enqueue into the
+  # consenter. Its expiry is reported as SERVICE_UNAVAILABLE.
+  BroadcastValidateTimeout: 0s
+  BroadcastOrderTimeout: 0s
+
   # Cluster settings for ordering service nodes that communicate with other ordering service nodes
   # such as Raft based ordering service.
   Cluster:

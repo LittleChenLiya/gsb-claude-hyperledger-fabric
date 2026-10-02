@@ -101,7 +101,8 @@ var _ = Describe("Broadcast", func() {
 				"type", "ENDORSER_TRANSACTION",
 			}))
 			Expect(fakeValidateHistogram.ObserveCallCount()).To(Equal(1))
-			Expect(fakeValidateHistogram.ObserveArgsForCall(0)).To(BeNumerically(">", 0))
+			// Duration can be zero on coarse-resolution Windows timers, so
+			// only an upper bound is asserted here.
 			Expect(fakeValidateHistogram.ObserveArgsForCall(0)).To(BeNumerically("<", 1))
 
 			Expect(fakeEnqueueHistogram.WithCallCount()).To(Equal(1))
@@ -111,7 +112,7 @@ var _ = Describe("Broadcast", func() {
 				"type", "ENDORSER_TRANSACTION",
 			}))
 			Expect(fakeEnqueueHistogram.ObserveCallCount()).To(Equal(1))
-			Expect(fakeEnqueueHistogram.ObserveArgsForCall(0)).To(BeNumerically(">", 0))
+			// Duration can be zero on coarse-resolution Windows timers.
 			Expect(fakeEnqueueHistogram.ObserveArgsForCall(0)).To(BeNumerically("<", 1))
 
 			Expect(fakeProcessedCounter.WithCallCount()).To(Equal(1))

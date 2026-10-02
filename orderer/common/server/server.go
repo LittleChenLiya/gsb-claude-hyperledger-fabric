@@ -89,12 +89,16 @@ func NewServer(
 	timeWindow time.Duration,
 	mutualTLS bool,
 	expirationCheckDisabled bool,
+	broadcastValidateTimeout time.Duration,
+	broadcastOrderTimeout time.Duration,
 ) ab.AtomicBroadcastServer {
 	s := &server{
 		dh: deliver.NewHandler(deliverSupport{Registrar: r}, timeWindow, mutualTLS, deliver.NewMetrics(metricsProvider), expirationCheckDisabled),
 		bh: &broadcast.Handler{
 			SupportRegistrar: broadcastSupport{Registrar: r},
 			Metrics:          broadcast.NewMetrics(metricsProvider),
+			ValidateTimeout:  broadcastValidateTimeout,
+			OrderTimeout:     broadcastOrderTimeout,
 		},
 		debug:     debug,
 		Registrar: r,
